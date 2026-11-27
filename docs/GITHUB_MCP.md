@@ -60,7 +60,7 @@ Policy is read from `config/github_mcp.json` under `GITHUB_MCP_ROOT`, or under t
 
 ## Authentication
 
-The server reads one Windows Credential Manager entry. It accepts the blob only when all of the metadata matches:
+On Windows, the server reads one Windows Credential Manager entry. It accepts the blob only when all of the metadata matches:
 
 - Target name: `me3-icy-github-mcp-token`
 - Username: `github-token`
@@ -74,6 +74,8 @@ There is no environment fallback and no file fallback. `GITHUB_TOKEN`, `GITHUB_M
 The client still places the name `GITHUB_MCP_SECRET_FILE` in the child environment. That name is not a credential source. Creating a secret file does not enable GitHub access.
 
 The parent process does not need the token to start the client. The child reads it only inside the server process, and only when a tool builds request headers.
+
+Linux does not use Credential Manager. `realtime_c.github_credentials` selects Freedesktop Secret Service through `secret-tool` when that program is installed, and an unavailable-backend result when it is not. The Linux backend stays empty until `python -m realtime_c.github_credentials` stores a credential from a hidden prompt. Retrieval, replacement, and deletion go through that same provider. Status output names the backend and whether a credential is configured. It does not include the credential. A missing `secret-tool` does not fall back to a file or an environment variable.
 
 ## Policy
 
@@ -168,4 +170,58 @@ Uncertain create or upload results stay uncertain. The publisher does not treat 
 - Secret detection is incomplete.
 - An abandoned uncertain create can leave an empty public repository. Cleanup is manual.
 - The HTTP client is created only when a publication is admitted. Tests must not call `main()`.
-- This package does not start the spoken ICY agent, open a microphone, or talk to a Raspberry Pi.
+- This package does not start the spoken ICY agent or open a microphone.
+- The Pi credential command does not create a token and does not change GitHub token scopes.
+
+## ICY voice capabilities
+
+The spoken assistant stays the existing ICY pipeline. GitHub tools are added to the same MCP session when `config/github_mcp.json` has `enabled` and `allow_reads`. The production file stays disabled. Enabling reads does not enable writes.
+
+Read tools, all GET-only and allowlisted:
+
+- Repository details, repository list, branches, and tags.
+- Directory listing, file text, commits, one commit, and compare.
+- Issues, pull requests, pull request comments, and review states.
+- Releases.
+- Workflow files, runs, and a log-availability check. Those three stay closed unless `allow_workflows` is true. Collaborator listing stays closed unless `allow_permissions` is true. The log archive is not downloaded.
+
+Examples: "Show me my GitHub repositories." "Open the README." "Show the latest commits." "Check whether there are open pull requests."
+
+Local Git uses `config/git_workspace.json` with `workspace_root`. Paths outside that directory are rejected. Clone will not replace an existing directory. Pull and push stop when the worktree is dirty. Remote URLs that contain credentials are rejected, and other remote URLs are redacted. There is no automatic clean or reset.
+
+Examples: "Clone that repository into my approved workspace." "Check my local changes."
+
+Writes use `github_prepare_operation` and `github_approve_operation`. The preview is bound to the operation, target, and content hash. Approval is one-shot, expires, and is recorded in `realtime_c/logs/github_operations/consumed.ledger`. That ledger is separate from publication replay. A changed preview is refused. The remote result is read back after a successful response. `allow_writes` stays false in the committed production policy. Repository-creation grants are not reused.
+
+GitHub reads, clone, fetch, pull, and approved writes return a `task_id` when the background worker is attached. A later turn uses `icy_task_status`, `icy_task_result`, and `icy_task_cancel`. The worker does not speak and does not edit conversation history. Clone, fetch, and pull use a 75 second worker deadline. An approved write uses 90 seconds. Those deadlines do not kill a Git process or a GitHub request that has already started. Cancellation before the worker starts does not run the operation. Cancellation after it starts reports that the operation may still be running.
+
+Short workspace reads stay on the caller: status, branch, remotes, log, diff, changed files, and a clean check. A second mutating Git command returns `workspace_busy` while one mutation holds the workspace lock.
+
+The existing 16 local MCP tools stay registered. GitHub names are additional. Production policy keeps write, workflow, permission, and destructive tools hidden.
+
+## Raspberry Pi 5
+
+SSH to `xelaubalde@192.168.100.12` succeeded on 2026-11-27. The machine is aarch64, Python 3.13.5, Git 2.47.3, 4 cores, and about 4 GB of RAM with about 3.6 GB available. `/home/xelaubalde/me3/.venv` imports `mcp` and `httpx`. Its `config/github_mcp.json` has `enabled` false. `secret-tool` is not installed, gnome-keyring is inactive, and `sudo` asks for a password, so packages were not installed from this session. The spoken assistant was not started. No microphone or speaker was used. The Windows credential was not copied to the Pi.
+
+Install from a checkout. GitHub stays disabled until the policy file is edited on purpose:
+
+```
+python3 -m pip install -r requirements.txt
+sudo apt-get install -y git libsecret-tools
+python3 -m realtime_c.github_credentials
+```
+
+The credential command prompts twice without echoing, stores the value through Secret Service, and prints only whether it was stored. Do not pass the value on the command line.
+
+Copy `config/github_mcp.example.json` only as a starting point, then keep `enabled` false until a read-only trial. Keep `allow_writes`, `allow_repo_creation`, `allow_workflows`, `allow_permissions`, and `allow_destructive` false. Copy `config/git_workspace.example.json` to `config/git_workspace.json` and set `workspace_root` to an existing directory. Do not point that directory at the assistant checkout.
+
+Health, from the repository root:
+
+```
+python3 -c "from realtime_c.github_credentials import sanitized_status; print(sanitized_status())"
+python3 -m mcp_servers.github_server
+```
+
+The status line has no credential. The server logs `auth=ok` or `auth=missing` and then waits on stdio. Stop it with an end-of-file on stdin. Stop the background worker before closing an MCP child. If a Git command is still inside the worker, shutdown does not claim that command was killed.
+
+If Secret Service is missing, status returns `unavailable_backend` and GitHub requests stay unauthenticated. Do not add a token file, a shell profile, or an environment variable to bypass that.

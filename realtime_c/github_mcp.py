@@ -52,6 +52,8 @@ _LOG = logging.getLogger("realtime_c.github_mcp")
 if not any(isinstance(item, RedactingLogFilter) for item in _LOG.filters):
     _LOG.addFilter(RedactingLogFilter())
 
+from mcp_servers.github_reads import EXECUTE_TOOL_NAME, READ_CAPABILITY_TOOLS
+
 GITHUB_TOOL_NAMES = (
     "github_prepare_publish",
     "github_create_repository",
@@ -59,6 +61,8 @@ GITHUB_TOOL_NAMES = (
     "github_commit_files",
     "github_get_repository",
     "github_get_job_status",
+    *READ_CAPABILITY_TOOLS,
+    EXECUTE_TOOL_NAME,
 )
 
 _DEFAULT_TIMEOUT_S = 45.0
@@ -325,6 +329,7 @@ class GithubMcpClient:
         arguments: dict[str, Any] | None = None,
         token: TurnCallToken | None = None,
         job_id: str | None = None,
+        wait_s: float | None = None,
     ) -> str:
         if token is not None and token.pre_cancelled_at_entry:
             raise GithubCallCancelled(token.call_id)
@@ -366,7 +371,7 @@ class GithubMcpClient:
             self._call(name, arguments or {}, job_id=job_id, on_dispatch=dispatched.set),
             self.loop,
         )
-        return self._wait_foreground(future, token, dispatched)
+        return self._wait_foreground(future, token, dispatched, wait_s)
 
     def _read_busy_json(self) -> str:
         return json.dumps({
@@ -571,9 +576,16 @@ class GithubMcpClient:
                 return self._read_consumed_json()
             return claimed
 
-    def _wait_foreground(self, future: Any, token: TurnCallToken | None, dispatched: threading.Event) -> str:
+    def _wait_foreground(
+        self,
+        future: Any,
+        token: TurnCallToken | None,
+        dispatched: threading.Event,
+        wait_s: float | None = None,
+    ) -> str:
         """Wait on this thread only. A late cancel does not cancel a dispatched call."""
-        deadline = time.monotonic() + self.foreground_wait_s
+        limit = self.foreground_wait_s if wait_s is None else wait_s
+        deadline = time.monotonic() + limit
         while True:
             if token is not None and token.cancel_event.is_set() and not dispatched.is_set():
                 future.cancel()

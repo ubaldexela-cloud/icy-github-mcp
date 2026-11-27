@@ -513,6 +513,10 @@ def _read_secret_with(read, free) -> str | None:
 
 def _auth_token() -> str | None:
     """Return the child credential, or None. No environment or file fallback."""
+    if os.name != "nt":
+        from realtime_c.github_credentials import retrieve_platform_token
+
+        return retrieve_platform_token()
     api = _windows_credential_api()
     if api is None:
         return None
@@ -2398,6 +2402,48 @@ def github_get_repository(owner: str, repo: str, ctx: Context | None = None) -> 
     if not meta_ok:
         return _err(meta_error or "invalid_job_metadata", "The job metadata is not valid.")
     return _public_json(get_repository_payload(owner, repo))
+
+
+_read_client_for_tests: Any = None
+_read_headers_for_tests: dict[str, str] | None = None
+
+
+def set_read_client_for_tests(client: Any, headers: dict[str, str] | None = None) -> None:
+    """Install a fake GET client for read tools. None keeps production reads closed."""
+    global _read_client_for_tests, _read_headers_for_tests
+    _read_client_for_tests = client
+    _read_headers_for_tests = headers
+
+
+class _ReadBridge:
+    def policy_root(self) -> Path:
+        return _policy_root()
+
+    def err(self, code: str, spoken: str) -> str:
+        return _err(code, spoken)
+
+    def public_json(self, payload: dict[str, Any]) -> str:
+        return _public_json(payload)
+
+    def headers(self) -> dict[str, str] | None:
+        if _read_headers_for_tests is not None:
+            return dict(_read_headers_for_tests)
+        return _auth_headers()
+
+    def client(self) -> Any:
+        if _read_client_for_tests is not None:
+            return _read_client_for_tests
+        if not _production_transport_armed:
+            return None
+        return _production_http_client()
+
+    def job_metadata(self, ctx: Context | None):
+        return _extract_wire_job_metadata(ctx)
+
+
+from mcp_servers.github_reads import register_read_tools
+
+register_read_tools(mcp, _ReadBridge(), sys.modules[__name__])
 
 
 def main() -> None:

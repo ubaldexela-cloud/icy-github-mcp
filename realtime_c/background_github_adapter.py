@@ -247,6 +247,34 @@ class GithubClientRepositoryReader:
             with self._lock:
                 self._in_use = False
 
+    def read_named(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        cancelled: Callable[[], bool],
+        wait_for_cancel: Callable[[float | None], bool],
+    ) -> str:
+        """Read a non-repository tool on the worker thread."""
+        self._require_worker()
+        with self._lock:
+            if self._in_use:
+                raise SessionBusy("session is already in use")
+            self._in_use = True
+        try:
+            cancel_event = threading.Event()
+            if cancelled() or wait_for_cancel(0):
+                cancel_event.set()
+            token = _ClientCancelView(cancel_event)
+            wait_s = getattr(self._client, "timeout", 45)
+            text = self._client.call(tool_name, dict(arguments), token, wait_s=wait_s)
+        finally:
+            with self._lock:
+                self._in_use = False
+        if not isinstance(text, str):
+            raise RepositoryReadFailed("repository read failed")
+        return text
+
     def _require_worker(self) -> None:
         ident = self._worker.status().thread_ident
         if ident is None or ident != threading.get_ident():
@@ -343,6 +371,8 @@ class BackgroundGithubAdapter:
         self._results = results
         self._reader = reader
         self._submit_lock = threading.Lock()
+        self._local_runners: dict[str, Callable[..., str]] = {}
+        self._local_seq = 0
         self._startup_cleanup_error: str | None = None
 
     @property
@@ -485,6 +515,91 @@ class BackgroundGithubAdapter:
                 False,
             )
 
+    def submit_named_read(
+        self,
+        conversation_id: str,
+        origin_turn_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> RepositoryTaskAck:
+        """Queue one read tool and return without waiting for GitHub."""
+        if not hasattr(self._reader, "read_named"):
+            raise AdapterRejected("named reads are not available")
+        conversation_id = _identifier(conversation_id, "conversation_id", _ID_RE)
+        origin_turn_id = _identifier(origin_turn_id, "origin_turn_id", _ID_RE)
+        tool_name = _identifier(tool_name, "tool_name", _NAME_RE)
+        owner = str(arguments.get("owner") or "")
+        repo = str(arguments.get("repo") or "")
+        dedup_key = f"read:{tool_name}:{owner}:{repo}"[:128]
+        with self._submit_lock:
+            task_id = self._registry.create(
+                conversation_id,
+                origin_turn_id,
+                task_type=tool_name,
+                deduplication_key=dedup_key,
+            )
+            snapshot = self._registry.get(task_id)
+            if snapshot.operations:
+                operation = snapshot.operations[0]
+                return RepositoryTaskAck(task_id, operation.operation_id, conversation_id, snapshot.state, True)
+            admitted = self._worker.submit(
+                task_id,
+                tool_name,
+                self._execute_named,
+                arguments={
+                    "tool_name": tool_name,
+                    "arguments": dict(arguments),
+                    "conversation_id": conversation_id,
+                },
+            )
+            return RepositoryTaskAck(admitted.task_id, admitted.operation_id, conversation_id, admitted.state, False)
+
+    def submit_local_job(
+        self,
+        conversation_id: str,
+        origin_turn_id: str,
+        tool_name: str,
+        runner: Callable[[], str],
+        timeout: float | None = None,
+    ) -> RepositoryTaskAck:
+        """Queue one local Git or approved write. The runner returns a JSON string.
+
+        ``timeout`` is the worker deadline. It does not interrupt a Git
+        process or a GitHub request that has already started.
+        """
+        if not callable(runner):
+            raise AdapterRejected("background runner is not callable")
+        conversation_id = _identifier(conversation_id, "conversation_id", _ID_RE)
+        origin_turn_id = _identifier(origin_turn_id, "origin_turn_id", _ID_RE)
+        tool_name = _identifier(tool_name, "tool_name", _NAME_RE)
+        with self._submit_lock:
+            self._local_seq += 1
+            dedup_key = f"local:{tool_name}:{self._local_seq}"
+            task_id = self._registry.create(
+                conversation_id,
+                origin_turn_id,
+                task_type=tool_name,
+                deduplication_key=dedup_key,
+            )
+            self._local_runners[task_id] = runner
+            snapshot = self._registry.get(task_id)
+            if snapshot.operations:
+                self._local_runners.pop(task_id, None)
+                operation = snapshot.operations[0]
+                return RepositoryTaskAck(task_id, operation.operation_id, conversation_id, snapshot.state, True)
+            try:
+                admitted = self._worker.submit(
+                    task_id,
+                    tool_name,
+                    self._execute_local,
+                    arguments={"conversation_id": conversation_id, "tool_name": tool_name},
+                    timeout=timeout,
+                )
+            except Exception:
+                self._local_runners.pop(task_id, None)
+                raise
+            return RepositoryTaskAck(admitted.task_id, admitted.operation_id, conversation_id, admitted.state, False)
+
     def cancel(self, conversation_id: str, task_id: str) -> TaskSnapshot:
         """Cancel one task in this conversation. Other tasks stay as they are."""
         conversation_id = _identifier(conversation_id, "conversation_id", _ID_RE)
@@ -610,6 +725,52 @@ class BackgroundGithubAdapter:
             context.operation_id,
             outcome="returned",
         )
+
+    def _execute_named(self, context: ExecutionContext) -> None:
+        tool_name = context.arguments.get("tool_name")
+        arguments = context.arguments.get("arguments")
+        conversation_id = context.arguments.get("conversation_id")
+        if not isinstance(tool_name, str) or not isinstance(arguments, dict) or not isinstance(conversation_id, str):
+            raise RepositoryReadFailed("repository read failed")
+        if context.cancelled():
+            self._registry.note_finished(context.task_id, context.operation_id, outcome="abandoned")
+            return
+        payload = self._reader.read_named(
+            tool_name,
+            arguments,
+            cancelled=context.cancelled,
+            wait_for_cancel=context.wait_for_cancel,
+        )
+        if not isinstance(payload, str):
+            raise RepositoryReadFailed("repository read failed")
+        self._results.put(conversation_id, context.task_id, context.operation_id, payload)
+        self._registry.note_finished(context.task_id, context.operation_id, outcome="returned")
+
+    def _execute_local(self, context: ExecutionContext) -> None:
+        conversation_id = context.arguments.get("conversation_id")
+        runner = self._local_runners.pop(context.task_id, None)
+        if not isinstance(conversation_id, str) or runner is None:
+            self._registry.note_finished(context.task_id, context.operation_id, outcome="abandoned")
+            return
+        if context.cancelled():
+            self._registry.note_finished(context.task_id, context.operation_id, outcome="abandoned")
+            return
+        try:
+            payload = runner()
+        except Exception:
+            payload = (
+                '{"ok": false, "error": "background_job_failed", '
+                '"spoken_status": "The background Git operation failed.", '
+                '"remote_may_still_run": true, "write_attempted": false}'
+            )
+        if not isinstance(payload, str) or not payload.strip():
+            payload = '{"ok": false, "error": "background_job_failed", "spoken_status": "The background Git operation failed."}'
+        try:
+            self._results.put(conversation_id, context.task_id, context.operation_id, payload)
+        except Exception:
+            self._registry.note_finished(context.task_id, context.operation_id, outcome="returned")
+            raise ResultStoreFailed("result was rejected") from None
+        self._registry.note_finished(context.task_id, context.operation_id, outcome="returned")
 
 
 def _relay_cancel(
