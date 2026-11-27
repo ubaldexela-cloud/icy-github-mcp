@@ -1,0 +1,5 @@
+mcp>=2.3,<3
+httpx>=0.27,<1
+openai>=1.68,<4
+certifi>=2024.2.2
+geonamescache>=2.0,<3
