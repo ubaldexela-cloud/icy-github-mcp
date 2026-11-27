@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "allowed_owner": "example-owner",
+  "allowed_repos": ["example-repository"],
+  "allow_reads": true,
+  "allow_writes": false,
+  "allow_repo_creation": false,
+  "allow_workflows": false,
+  "allow_permissions": false,
+  "allow_destructive": false
+}
